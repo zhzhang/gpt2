@@ -1,6 +1,8 @@
 import math
+from typing import Optional
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class AttentionHead(nn.Module):
@@ -17,7 +19,12 @@ class AttentionHead(nn.Module):
 
         self.output_projection = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(64, 64)).view(1, 1, 64, 64),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # X shape is (batch_size, sequence_length, d_model)
         batch_size, sequence_length, d_model = x.size()
         # (batch_size, sequence_length, 3 * d_model)
@@ -42,7 +49,9 @@ class AttentionHead(nn.Module):
         # Scale the attention scores by 1 / sqrt(d_model)
         # TODO: what happens if we put the scale after the mask?
         attn = attn / math.sqrt(d_model)
-        attn = attn.masked_fill(mask == 0, float("-inf"))
+        attn = attn.masked_fill(
+            self.bias[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
+        )
         # TODO: see if this softmax is in the right dimension.
         attn = attn.softmax(dim=-2)
         # (batch_size, n_heads, sequence_length, d_head)
@@ -57,12 +66,14 @@ class AttentionHead(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
-        self.d_model = d_model
         self.input = nn.Linear(d_model, 4 * d_model)
         self.output = nn.Linear(4 * d_model, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.output(torch.relu(self.input(x)))
+        x = self.input(x)
+        x = F.gelu(x)
+        x = self.output(x)
+        return x
 
 
 class Block(nn.Module):
@@ -71,9 +82,9 @@ class Block(nn.Module):
         self.attention = AttentionHead(d_model, n_heads)
         self.feed_forward = FeedForward(d_model)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x += self.attention(x, mask)
-        x += self.feed_forward(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.attention(x) + x
+        x = self.feed_forward(x) + x
         return x
 
 
@@ -84,21 +95,40 @@ class GPT(nn.Module):
         self.n_heads = n_heads
         self.n_layers = n_layers
 
-        self.token_embedding = (nn.Embedding(50257, d_model),)
-        self.position_embedding = nn.Embedding(1024, d_model)
+        self.token_embedding = nn.Embedding(50257, d_model)
+        self.position_embedding = nn.Embedding(64, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(n_layers)])
         self.layer_norm = nn.LayerNorm(d_model)
         self.output = nn.Linear(d_model, d_model)
 
-    def forward(self, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # TODO: understand this
+        self.lm_head = nn.Linear(d_model, 50257, bias=False)
+        self.lm_head.LLMC_SKIP_INIT = 1  # don't init this one, we will tie weights
+        self.token_embedding.weight = (
+            self.lm_head.weight
+        )  # https://paperswithcode.com/method/weight-tying
+
+    def forward(
+        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         token_embeds = self.token_embedding(idx)
-        position_embeds = self.position_embedding(torch.arange(len(idx)))
+        position_embeds = self.position_embedding(torch.arange(idx.size(1)))
         x = token_embeds + position_embeds
 
         for block in self.blocks:
-            x = block(x, mask)
+            x = block(x)
         x = self.layer_norm(x)
-        return self.output(x)
+        x = self.output(x)
+
+        loss = None
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            )
+
+        return x, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, zero_stage):
         # start with all of the candidate parameters
@@ -125,3 +155,30 @@ class GPT(nn.Module):
         print("using regular AdamW")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= 64 else idx[:, -64:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("Inf")
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx

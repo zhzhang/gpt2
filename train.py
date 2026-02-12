@@ -7,6 +7,8 @@ import tiktoken
 import torch
 from model import GPT
 
+torch.autograd.set_detect_anomaly(True)
+
 
 def _peek_data_shard(filename):
     # only reads the header, returns header data
@@ -117,10 +119,10 @@ model.train()
 
 # load tokens
 train_loader = DistributedDataLoader(
-    "dev/data/tinyshakespeare/tiny_shakespeare_train.bin", B, T, -1, 1
+    "dev/data/tinyshakespeare/tiny_shakespeare_train.bin", B, T, 0, 1
 )
 val_loader = DistributedDataLoader(
-    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, -1, 1
+    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
 )
 
 LEARNING_RATE = 1e-4
@@ -169,33 +171,34 @@ for step in range(NUM_ITERATIONS + 1):
     last_step = step == NUM_ITERATIONS
 
     # once in a while evaluate the validation dataset
-    if (step % VAL_LOSS_EVERY == 0 or last_step) and (val_loader is not None):
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss = 0.0
-            for _ in range(VAL_MAX_STEPS):
-                x, y = val_loader.next_batch()
-                _, loss = model(x, y, return_logits=False)
-                val_loss += loss.item()
-            val_loss /= VAL_MAX_STEPS
-        # log to console and to file
-        print(f"val loss {val_loss}")
+    # if (step % VAL_LOSS_EVERY == 0 or last_step) and (val_loader is not None):
+    #     model.eval()
+    #     val_loader.reset()
+    #     with torch.no_grad():
+    #         val_loss = 0.0
+    #         for _ in range(VAL_MAX_STEPS):
+    #             x, y = val_loader.next_batch()
+    #             _, loss = model(x, y)
+    #             print(loss)
+    #             val_loss += loss.item()
+    #         val_loss /= VAL_MAX_STEPS
+    #     # log to console and to file
+    #     print(f"val loss {val_loss}")
 
     # once in a while perform model inference on the master process
-    if step % SAMPLE_EVERY == 0 or last_step:
-        model.eval()
-        # before we end, let's also do one round of inference
-        # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-        start_ids = [enc.eot_token]
-        xg = torch.tensor(start_ids, dtype=torch.long)[None, ...]
-        max_new_tokens = 32
-        temperature = 1.0
-        top_k = 40
-        yg = model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
-        print("---------------")
-        print(enc.decode(yg[0].tolist()))
-        print("---------------")
+    # if step % SAMPLE_EVERY == 0 or last_step:
+    #     model.eval()
+    #     # before we end, let's also do one round of inference
+    #     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+    #     start_ids = [enc.eot_token]
+    #     xg = torch.tensor(start_ids, dtype=torch.long)[None, ...]
+    #     max_new_tokens = 32
+    #     temperature = 1.0
+    #     top_k = 40
+    #     yg = model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+    #     print("---------------")
+    #     print(enc.decode(yg[0].tolist()))
+    #     print("---------------")
 
     # bit confusing: we want to make sure to eval and sample on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
@@ -218,12 +221,13 @@ for step in range(NUM_ITERATIONS + 1):
         # fetch a batch
         x, y = train_loader.next_batch()
         # forward pass
-        _, loss = model(x, y, return_logits=False)
+        _, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN, so we scale the loss here
         loss = loss / GRAD_ACCUM_STEPS
+        print(loss)
         lossf += loss.detach()  # keep track of the mean loss
         # backward pass
         loss.backward()
