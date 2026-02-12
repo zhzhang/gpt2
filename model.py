@@ -1,5 +1,4 @@
 import math
-
 import torch
 from torch import nn
 
@@ -84,10 +83,45 @@ class GPT(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
+
+        self.token_embedding = (nn.Embedding(50257, d_model),)
+        self.position_embedding = nn.Embedding(1024, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(n_layers)])
+        self.layer_norm = nn.LayerNorm(d_model)
         self.output = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        token_embeds = self.token_embedding(idx)
+        position_embeds = self.position_embedding(torch.arange(len(idx)))
+        x = token_embeds + position_embeds
+
         for block in self.blocks:
             x = block(x, mask)
+        x = self.layer_norm(x)
         return self.output(x)
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, zero_stage):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
+        # Create AdamW optimizer and use the fused version if it is available
+        print("using regular AdamW")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+        return optimizer
