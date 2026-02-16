@@ -100,7 +100,7 @@ class DistributedDataLoader:
 
 
 # args error checking and convenience variables
-B, T = 256, 64
+B, T = 4, 64
 assert 1 <= T <= 1024
 
 
@@ -113,13 +113,14 @@ enc = tiktoken.get_encoding("gpt2")
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
-model = GPT(d_model=768, n_heads=12, n_layers=12)
+# model = GPT(d_model=768, n_heads=12, n_layers=12)
+model = GPT.from_pretrained()
 model.train()
 
 
 # load tokens
 train_loader = DistributedDataLoader(
-    "dev/data/tinyshakespeare/tiny_shakespeare_train.bin", B, T, 0, 1
+    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
 )
 val_loader = DistributedDataLoader(
     "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
@@ -210,9 +211,6 @@ for step in range(NUM_ITERATIONS + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    # if we are trying to overfit a single batch, we reset the loader here
-    if OVERFIT_SINGLE_BATCH:
-        train_loader.reset()
     # micro-batch loop where we do gradient accumulation to reach desired total batch size
     lossf = (
         0.0  # for getting the mean loss (as simple float) over the accumulation steps

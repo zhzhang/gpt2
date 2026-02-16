@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 
 class AttentionHead(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         # Reason for the above assert is detailed in the forward pass.
@@ -20,8 +20,10 @@ class AttentionHead(nn.Module):
         self.output_projection = nn.Linear(d_model, d_model)
 
         self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(64, 64)).view(1, 1, 64, 64),
+            "mask",
+            torch.tril(torch.ones(context_length, context_length)).view(
+                1, 1, context_length, context_length
+            ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -50,15 +52,16 @@ class AttentionHead(nn.Module):
         # TODO: what happens if we put the scale after the mask?
         attn = attn / math.sqrt(d_model)
         attn = attn.masked_fill(
-            self.bias[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
+            self.mask[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
         )
         # TODO: see if this softmax is in the right dimension.
-        attn = attn.softmax(dim=-2)
+        attn = attn.softmax(dim=-1)
         # (batch_size, n_heads, sequence_length, d_head)
         attn = attn @ v
         # Swap back the sequence length and head dimensions.
-        output = attn.transpose(1, 2)
-        output = output.reshape(batch_size, sequence_length, d_model)
+        output = (
+            attn.transpose(1, 2).contiguous().view(batch_size, sequence_length, d_model)
+        )
         output = self.output_projection(output)
         return output
 
@@ -77,39 +80,50 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
-        self.attention = AttentionHead(d_model, n_heads)
+        self.layer_norm_1 = nn.LayerNorm(d_model)
+        self.attention = AttentionHead(d_model, n_heads, context_length)
+        self.layer_norm_2 = nn.LayerNorm(d_model)
         self.feed_forward = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layer_norm_1(x)
         x = self.attention(x) + x
+        x = self.layer_norm_2(x)
         x = self.feed_forward(x) + x
         return x
 
 
 class GPT(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_layers: int):
+    def __init__(self, d_model: int, n_heads: int, n_layers: int, context_length: int):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
+        self.context_length = context_length
 
-        self.token_embedding = nn.Embedding(50257, d_model)
-        self.position_embedding = nn.Embedding(64, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(n_layers)])
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.output = nn.Linear(d_model, d_model)
+        self.token_embedding = nn.Embedding(50257, self.d_model)
+        self.position_embedding = nn.Embedding(self.context_length, self.d_model)
+        self.blocks = nn.ModuleList(
+            [
+                Block(self.d_model, self.n_heads, self.context_length)
+                for _ in range(self.n_layers)
+            ]
+        )
+        self.layer_norm = nn.LayerNorm(self.d_model)
 
-        # TODO: understand this
-        self.lm_head = nn.Linear(d_model, 50257, bias=False)
-        self.lm_head.LLMC_SKIP_INIT = 1  # don't init this one, we will tie weights
-        self.token_embedding.weight = (
-            self.lm_head.weight
-        )  # https://paperswithcode.com/method/weight-tying
+        # Ties the token embedding and the output projection.
+        # Output of the last transformer layer looks at the entire vocabulary and
+        # picks via dot product which token is most likely to come next.
+        self.lm_head = nn.Linear(self.d_model, 50257, bias=False)
+        self.token_embedding.weight = self.lm_head.weight
 
     def forward(
-        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        return_logits: bool = True,
     ) -> torch.Tensor:
         token_embeds = self.token_embedding(idx)
         position_embeds = self.position_embedding(torch.arange(idx.size(1)))
@@ -118,7 +132,6 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.layer_norm(x)
-        x = self.output(x)
 
         loss = None
         if targets is not None:
@@ -130,7 +143,9 @@ class GPT(nn.Module):
 
         return x, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, zero_stage):
+    def configure_optimizers(
+        self, weight_decay, learning_rate, betas, zero_stage, device_type=None
+    ):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -165,7 +180,11 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= 64 else idx[:, -64:]
+            idx_cond = (
+                idx
+                if idx.size(1) <= self.context_length
+                else idx[:, -self.context_length :]
+            )
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
@@ -182,3 +201,107 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @classmethod
+    def from_pretrained(cls, _sdf=None):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        from transformers import GPT2LMHeadModel
+
+        print("mine: loading weights from pretrained gpt2 base")
+
+        model = GPT(n_layers=12, n_heads=12, d_model=768, context_length=1024)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [
+            k for k in sd_keys if not k.endswith(".attention.mask")
+        ]  # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        pretrained_model = GPT2LMHeadModel.from_pretrained("gpt2")
+        pretrained_sd = pretrained_model.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        pretrained_sd_keys = pretrained_sd.keys()
+        # ignore mask buffers
+        pretrained_sd_keys = [
+            k for k in pretrained_sd_keys if not k.endswith(".attn.masked_bias")
+        ]
+        pretrained_sd_keys = [
+            k for k in pretrained_sd_keys if not k.endswith(".attn.bias")
+        ]
+        transposed = [
+            "attn.c_attn.weight",
+            "attn.c_proj.weight",
+            "mlp.c_fc.weight",
+            "mlp.c_proj.weight",
+        ]
+        parameter_name_mapping = {}
+        for k in sd_keys:
+            target_key = None
+            first, rest = k.split(".", 1)
+            if first == "token_embedding":
+                target_key = "transformer.wte.weight"
+            elif first == "position_embedding":
+                target_key = "transformer.wpe.weight"
+            elif first == "blocks":
+                idx, rest = rest.split(".", 1)
+                if rest == "layer_norm_1.weight":
+                    target_key = f"transformer.h.{idx}.ln_1.weight"
+                elif rest == "layer_norm_1.bias":
+                    target_key = f"transformer.h.{idx}.ln_1.bias"
+                elif rest == "layer_norm_2.weight":
+                    target_key = f"transformer.h.{idx}.ln_2.weight"
+                elif rest == "layer_norm_2.bias":
+                    target_key = f"transformer.h.{idx}.ln_2.bias"
+                elif rest == "attention.input_projection.weight":
+                    target_key = f"transformer.h.{idx}.attn.c_attn.weight"
+                elif rest == "attention.input_projection.bias":
+                    target_key = f"transformer.h.{idx}.attn.c_attn.bias"
+                elif rest == "attention.output_projection.weight":
+                    target_key = f"transformer.h.{idx}.attn.c_proj.weight"
+                elif rest == "attention.output_projection.bias":
+                    target_key = f"transformer.h.{idx}.attn.c_proj.bias"
+                elif rest == "feed_forward.input.weight":
+                    target_key = f"transformer.h.{idx}.mlp.c_fc.weight"
+                elif rest == "feed_forward.input.bias":
+                    target_key = f"transformer.h.{idx}.mlp.c_fc.bias"
+                elif rest == "feed_forward.output.weight":
+                    target_key = f"transformer.h.{idx}.mlp.c_proj.weight"
+                elif rest == "feed_forward.output.bias":
+                    target_key = f"transformer.h.{idx}.mlp.c_proj.bias"
+            elif first == "layer_norm":
+                if rest == "weight":
+                    target_key = "transformer.ln_f.weight"
+                elif rest == "bias":
+                    target_key = "transformer.ln_f.bias"
+            elif first == "lm_head":
+                target_key = "lm_head.weight"
+            if target_key is not None:
+                parameter_name_mapping[k] = target_key
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(pretrained_sd_keys) == len(sd_keys) and len(
+            pretrained_sd_keys
+        ) == len(parameter_name_mapping), (
+            f"mismatched keys: {len(pretrained_sd_keys)} != {len(sd_keys)}"
+        )
+        transposed = [
+            "attn.c_attn.weight",
+            "attn.c_proj.weight",
+            "mlp.c_fc.weight",
+            "mlp.c_proj.weight",
+        ]
+        for k in sd_keys:
+            target_key = parameter_name_mapping[k]
+            if any(target_key.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert pretrained_sd[target_key].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(pretrained_sd[target_key].t())
+            else:
+                # vanilla copy over the other parameters
+                assert pretrained_sd[target_key].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(pretrained_sd[target_key])
+
+        return model
