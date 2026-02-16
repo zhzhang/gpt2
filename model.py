@@ -6,6 +6,8 @@ from torch.nn import functional as F
 
 
 class AttentionHead(nn.Module):
+    PRINTED = False
+
     def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -50,7 +52,7 @@ class AttentionHead(nn.Module):
         attn = q @ k.transpose(-2, -1)
         # Scale the attention scores by 1 / sqrt(d_model)
         # TODO: what happens if we put the scale after the mask?
-        attn = attn / math.sqrt(d_model)
+        attn = attn / math.sqrt(d_model // self.n_heads)
         attn = attn.masked_fill(
             self.mask[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
         )
@@ -66,20 +68,40 @@ class AttentionHead(nn.Module):
         return output
 
 
+class NewGELU(nn.Module):
+    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
+
+    def forward(self, input):
+        return (
+            0.5
+            * input
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi)
+                    * (input + 0.044715 * torch.pow(input, 3.0))
+                )
+            )
+        )
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.input = nn.Linear(d_model, 4 * d_model)
+        self.gelu = NewGELU()
         self.output = nn.Linear(4 * d_model, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input(x)
-        x = F.gelu(x)
+        x = self.gelu(x)
         x = self.output(x)
         return x
 
 
 class Block(nn.Module):
+    PRINTED = False
+
     def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(d_model)
@@ -88,10 +110,13 @@ class Block(nn.Module):
         self.feed_forward = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer_norm_1(x)
-        x = self.attention(x) + x
-        x = self.layer_norm_2(x)
-        x = self.feed_forward(x) + x
+        # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
+        x = self.attention(self.layer_norm_1(x)) + x
+        if not Block.PRINTED:
+            print(x.shape)
+            print(self.attention(self.layer_norm_1(x)).shape)
+            Block.PRINTED = True
+        x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 
 

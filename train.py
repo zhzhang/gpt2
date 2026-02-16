@@ -208,6 +208,9 @@ for step in range(NUM_ITERATIONS + 1):
     if last_step:
         break
 
+    from train_gpt2 import GPT as ReferenceGPT
+
+    reference_model = ReferenceGPT.from_pretrained("gpt2")
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -220,12 +223,12 @@ for step in range(NUM_ITERATIONS + 1):
         x, y = train_loader.next_batch()
         # forward pass
         _, loss = model(x, y)
+        # _, _ = reference_model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN, so we scale the loss here
         loss = loss / GRAD_ACCUM_STEPS
-        print(loss)
         lossf += loss.detach()  # keep track of the mean loss
         # backward pass
         loss.backward()
