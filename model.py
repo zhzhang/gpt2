@@ -144,6 +144,30 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(self.d_model, 50257, bias=False)
         self.token_embedding.weight = self.lm_head.weight
 
+        self.init_rng = torch.Generator()
+        self.init_rng.manual_seed(42)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            print(module)
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            std = (
+                0.02
+                if not hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG")
+                else 0.02 / math.sqrt(2 * self.config.n_layer)
+            )
+            if not hasattr(module, "LLMC_SKIP_INIT"):
+                torch.nn.init.normal_(
+                    module.weight, mean=0.0, std=std, generator=self.init_rng
+                )
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02, generator=self.init_rng
+            )
+
     def forward(
         self,
         idx: torch.Tensor,
