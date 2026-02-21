@@ -1,0 +1,1 @@
+curl -fsSL https://raw.githubusercontent.com/zhzhang/gpt2/main/install.sh | sh
