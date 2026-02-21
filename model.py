@@ -166,7 +166,9 @@ class GPT(nn.Module):
         return_logits: bool = True,
     ) -> torch.Tensor:
         token_embeds = self.token_embedding(idx)
-        position_embeds = self.position_embedding(torch.arange(idx.size(1)))
+        position_embeds = self.position_embedding(
+            torch.arange(idx.size(1), dtype=torch.long, device=idx.device)
+        )
         x = token_embeds + position_embeds
 
         for block in self.blocks:

@@ -101,7 +101,7 @@ class DistributedDataLoader:
 
 
 # args error checking and convenience variables
-B, T = 4, 64
+B, T = 10, 1024
 assert 1 <= T <= 1024
 
 
@@ -118,9 +118,9 @@ if torch.cuda.is_available():
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
-model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
+# model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
+model = GPT.from_pretrained()
 model.to(device)
-# model = GPT.from_pretrained()
 model.train()
 
 
@@ -129,14 +129,14 @@ train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, 0, 
 val_loader = DistributedDataLoader("fineweb10B/fineweb_val_*.bin", B, T, 0, 1)
 
 LEARNING_RATE = 1e-4
-LEARNING_RATE_DECAY_FRAC = 1.0
-WEIGHT_DECAY = 0.0
+LEARNING_RATE_DECAY_FRAC = 0.0
+WEIGHT_DECAY = 0.1
 WARMUP_ITERS = 0
 NUM_ITERATIONS = 20000
 VAL_LOSS_EVERY = 100
 VAL_MAX_STEPS = 20
 EVAL_EVERY = 500
-GRAD_ACCUM_STEPS = 1
+GRAD_ACCUM_STEPS = 50
 GRAD_CLIP = 1.0
 
 # init the optimizer
