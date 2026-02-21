@@ -210,7 +210,7 @@ def evaluate(model, device):
         mask = mask.to(device)
 
         # get the logits
-        logits = model(tokens).logits
+        logits, _ = model(tokens)
         # evaluate the autoregressive loss at all positions
         shift_logits = (logits[..., :-1, :]).contiguous()
         shift_tokens = (tokens[..., 1:]).contiguous()

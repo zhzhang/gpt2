@@ -174,14 +174,14 @@ class GPT(nn.Module):
         x = self.layer_norm(x)
 
         loss = None
+        logits = self.lm_head(x)
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
 
-        return x, loss
+        return logits, loss
 
     def configure_optimizers(
         self, weight_decay, learning_rate, betas, zero_stage, device_type=None
