@@ -6,8 +6,6 @@ from torch.nn import functional as F
 
 
 class AttentionHead(nn.Module):
-    PRINTED = False
-
     def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -100,8 +98,6 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    PRINTED = False
-
     def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(d_model)
@@ -112,10 +108,6 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
         x = self.attention(self.layer_norm_1(x)) + x
-        if not Block.PRINTED:
-            print(x.shape)
-            print(self.attention(self.layer_norm_1(x)).shape)
-            Block.PRINTED = True
         x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 

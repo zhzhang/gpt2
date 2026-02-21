@@ -113,16 +113,14 @@ enc = tiktoken.get_encoding("gpt2")
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
-# model = GPT(d_model=768, n_heads=12, n_layers=12)
-model = GPT.from_pretrained()
+model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
+# model = GPT.from_pretrained()
 model.train()
 
 
 # load tokens
 train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, 0, 1)
-val_loader = DistributedDataLoader(
-    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
-)
+val_loader = DistributedDataLoader("fineweb10B/fineweb_val_*.bin", B, T, 0, 1)
 
 LEARNING_RATE = 1e-4
 LEARNING_RATE_DECAY_FRAC = 1.0
@@ -170,19 +168,18 @@ for step in range(NUM_ITERATIONS + 1):
     last_step = step == NUM_ITERATIONS
 
     # once in a while evaluate the validation dataset
-    # if (step % VAL_LOSS_EVERY == 0 or last_step) and (val_loader is not None):
-    #     model.eval()
-    #     val_loader.reset()
-    #     with torch.no_grad():
-    #         val_loss = 0.0
-    #         for _ in range(VAL_MAX_STEPS):
-    #             x, y = val_loader.next_batch()
-    #             _, loss = model(x, y)
-    #             print(loss)
-    #             val_loss += loss.item()
-    #         val_loss /= VAL_MAX_STEPS
-    #     # log to console and to file
-    #     print(f"val loss {val_loss}")
+    if (step % VAL_LOSS_EVERY == 0 or last_step) and (val_loader is not None):
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss = 0.0
+            for _ in range(VAL_MAX_STEPS):
+                x, y = val_loader.next_batch()
+                _, loss = model(x, y)
+                val_loss += loss.item()
+            val_loss /= VAL_MAX_STEPS
+        # log to console and to file
+        print(f"val loss {val_loss}")
 
     # once in a while perform model inference on the master process
     # if step % SAMPLE_EVERY == 0 or last_step:
