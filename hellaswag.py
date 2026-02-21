@@ -34,7 +34,6 @@ import torch
 import requests
 from tqdm import tqdm
 from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 import numpy as np
 
 # -----------------------------------------------------------------------------
@@ -196,13 +195,9 @@ def iterate_examples(split):
 
 
 @torch.no_grad()
-def evaluate(model_type, device):
-
-    torch.set_float32_matmul_precision("high")  # use tf32
-
-    model = GPT2LMHeadModel.from_pretrained(model_type)
+def evaluate(model, device):
     model.to(device)
-    # model = torch.compile(model)
+    torch.set_float32_matmul_precision("high")  # use tf32
 
     datas = []
     num_correct_norm = 0
@@ -254,21 +249,10 @@ def evaluate(model_type, device):
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
             print(f"predicted: {pred_norm}, actual: {label}")
+    acc = num_correct / num_total
+    acc_norm = num_correct_norm / num_total
 
     # now write the data to a .bin file
     filename = os.path.join(DATA_CACHE_DIR, "hellaswag_val.bin")
     write_evalfile(filename, datas)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-m", "--model_type", type=str, default="gpt2", help="the model type to use"
-    )
-    parser.add_argument(
-        "-d", "--device", type=str, default="cuda", help="the device to use"
-    )
-    args = parser.parse_args()
-    evaluate(args.model_type, args.device)
+    return acc, acc_norm

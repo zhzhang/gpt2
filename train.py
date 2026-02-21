@@ -6,6 +6,7 @@ import numpy as np
 import tiktoken
 import torch
 from model import GPT
+from hellaswag import evaluate
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -131,11 +132,10 @@ LEARNING_RATE = 1e-4
 LEARNING_RATE_DECAY_FRAC = 1.0
 WEIGHT_DECAY = 0.0
 WARMUP_ITERS = 0
-NUM_ITERATIONS = 10
-VAL_LOSS_EVERY = 10
+NUM_ITERATIONS = 20000
+VAL_LOSS_EVERY = 100
 VAL_MAX_STEPS = 20
-SAMPLE_EVERY = 10
-OVERFIT_SINGLE_BATCH = True
+EVAL_EVERY = 500
 GRAD_ACCUM_STEPS = 1
 GRAD_CLIP = 1.0
 
@@ -186,6 +186,10 @@ for step in range(NUM_ITERATIONS + 1):
             val_loss /= VAL_MAX_STEPS
         # log to console and to file
         print(f"val loss {val_loss}")
+
+    if step % EVAL_EVERY == 0:
+        acc, acc_norm = evaluate(model, device)
+        print(f"acc: {acc:.4f} acc_norm: {acc_norm:.4f}")
 
     # bit confusing: we want to make sure to eval and sample on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
