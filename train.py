@@ -111,9 +111,14 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
 model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
+model.to(device)
 # model = GPT.from_pretrained()
 model.train()
 
@@ -175,26 +180,12 @@ for step in range(NUM_ITERATIONS + 1):
             val_loss = 0.0
             for _ in range(VAL_MAX_STEPS):
                 x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
                 _, loss = model(x, y)
                 val_loss += loss.item()
             val_loss /= VAL_MAX_STEPS
         # log to console and to file
         print(f"val loss {val_loss}")
-
-    # once in a while perform model inference on the master process
-    # if step % SAMPLE_EVERY == 0 or last_step:
-    #     model.eval()
-    #     # before we end, let's also do one round of inference
-    #     # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-    #     start_ids = [enc.eot_token]
-    #     xg = torch.tensor(start_ids, dtype=torch.long)[None, ...]
-    #     max_new_tokens = 32
-    #     temperature = 1.0
-    #     top_k = 40
-    #     yg = model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
-    #     print("---------------")
-    #     print(enc.decode(yg[0].tolist()))
-    #     print("---------------")
 
     # bit confusing: we want to make sure to eval and sample on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
@@ -213,6 +204,7 @@ for step in range(NUM_ITERATIONS + 1):
     for micro_step in range(1):
         # fetch a batch
         x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         # forward pass
         _, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
