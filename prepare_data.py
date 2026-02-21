@@ -70,6 +70,7 @@ def write_datafile(filename, toks):
     )
     with open(filename, "wb") as f:
         f.write(header.tobytes())
+        f.write(toks_np.tobytes())
 
 
 def tokenize_gpt2(doc):

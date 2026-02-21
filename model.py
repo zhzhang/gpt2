@@ -150,7 +150,6 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            print(module)
             # apply special scaled init to the residual projections, per GPT-2 paper
             std = (
                 0.02

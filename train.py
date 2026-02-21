@@ -119,9 +119,7 @@ model.train()
 
 
 # load tokens
-train_loader = DistributedDataLoader(
-    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
-)
+train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, 0, 1)
 val_loader = DistributedDataLoader(
     "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, 0, 1
 )
