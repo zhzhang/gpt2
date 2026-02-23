@@ -183,12 +183,14 @@ for step in range(NUM_ITERATIONS + 1):
     lossf = (
         0.0  # for getting the mean loss (as simple float) over the accumulation steps
     )
-    for micro_step in range(1):
+    total_toks = 0
+    for micro_step in range(GRAD_ACCUM_STEPS):
         # fetch a batch
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # forward pass
         _, loss = model(x, y)
+        total_toks += x.size(0) * x.size(1)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
@@ -212,7 +214,7 @@ for step in range(NUM_ITERATIONS + 1):
     t1 = time.time()
     # the 0th iteration is often an outlier (much slower) => skip logging it
     print(
-        f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms)"
+        f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
     )
 
     # keep track of smooth timings, last 20 iterations
