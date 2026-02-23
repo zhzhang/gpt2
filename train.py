@@ -6,9 +6,8 @@ import os
 import numpy as np
 import tiktoken
 import torch
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, destroy_process_group
 from model import GPT
-from hellaswag import evaluate
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
@@ -145,7 +144,7 @@ GRAD_ACCUM_STEPS = 50
 GRAD_CLIP = 1.0
 
 # init the optimizer
-optimizer = model.configure_optimizers(
+optimizer = model.module.configure_optimizers(
     weight_decay=WEIGHT_DECAY,
     learning_rate=LEARNING_RATE,
     betas=(0.9, 0.95),
@@ -219,3 +218,5 @@ for step in range(NUM_ITERATIONS + 1):
     # keep track of smooth timings, last 20 iterations
     if step > 0 and step > NUM_ITERATIONS - 20:
         timings.append(t1 - t0)
+
+destroy_process_group()
