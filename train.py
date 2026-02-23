@@ -169,56 +169,57 @@ def get_lr(it):
     )  # coeff starts at 1 and goes to 0
     return min_lr + coeff * (LEARNING_RATE - min_lr)
 
-ctx = torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
 
 
 timings = []
 norm = -1.0  # dummy value to print in inference-only mode
-for step in range(NUM_ITERATIONS + 1):
-    t0 = time.time()
-    # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-    # micro-batch loop where we do gradient accumulation to reach desired total batch size
-    lossf = (
-        0.0  # for getting the mean loss (as simple float) over the accumulation steps
-    )
-    total_toks = 0
-    for micro_step in range(GRAD_ACCUM_STEPS):
-        # fetch a batch
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        # forward pass
-        _, loss = model(x, y)
-        total_toks += x.size(0) * x.size(1)
-        # we have to scale the loss to account for gradient accumulation,
-        # because the gradients just add on each successive backward().
-        # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN, so we scale the loss here
-        loss = loss / GRAD_ACCUM_STEPS
-        lossf += loss.detach()  # keep track of the mean loss
-        # backward pass
-        loss.backward()
-    lossf = lossf.item()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
-    # step the optimizer
-    optimizer.step()
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
 
-    # time and print
-    t1 = time.time()
-    # the 0th iteration is often an outlier (much slower) => skip logging it
-    print(
-        f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
-    )
+with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+    for step in range(NUM_ITERATIONS + 1):
+        t0 = time.time()
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        # micro-batch loop where we do gradient accumulation to reach desired total batch size
+        lossf = (
+            0.0  # for getting the mean loss (as simple float) over the accumulation steps
+        )
+        total_toks = 0
+        for micro_step in range(GRAD_ACCUM_STEPS):
+            # fetch a batch
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            # forward pass
+            _, loss = model(x, y)
+            total_toks += x.size(0) * x.size(1)
+            # we have to scale the loss to account for gradient accumulation,
+            # because the gradients just add on each successive backward().
+            # addition of gradients corresponds to a SUM in the objective, but
+            # instead of a SUM we want MEAN, so we scale the loss here
+            loss = loss / GRAD_ACCUM_STEPS
+            lossf += loss.detach()  # keep track of the mean loss
+            # backward pass
+            loss.backward()
+        lossf = lossf.item()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        # step the optimizer
+        optimizer.step()
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
 
-    # keep track of smooth timings, last 20 iterations
-    if step > 0 and step > NUM_ITERATIONS - 20:
-        timings.append(t1 - t0)
+        # time and print
+        t1 = time.time()
+        # the 0th iteration is often an outlier (much slower) => skip logging it
+        print(
+            f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
+        )
+
+        # keep track of smooth timings, last 20 iterations
+        if step > 0 and step > NUM_ITERATIONS - 20:
+            timings.append(t1 - t0)
 
 destroy_process_group()
