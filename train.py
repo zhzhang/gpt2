@@ -1,12 +1,14 @@
 import time
 import glob
 import math
+import os
 
 import numpy as np
 import tiktoken
 import torch
 from model import GPT
 from hellaswag import evaluate
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -104,6 +106,9 @@ class DistributedDataLoader:
 B, T = 10, 1024
 assert 1 <= T <= 1024
 
+rank = int(os.environ.get("LOCAL_RANK"))
+world_size = int(os.environ.get("WORLD_SIZE"))
+
 
 # rng / reproducibility
 torch.manual_seed(42)
@@ -118,24 +123,21 @@ if torch.cuda.is_available():
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
-# model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
-model = GPT.from_pretrained()
-model.to(device)
+model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
 model.train()
+model.to(device)
+model = torch.compile(model)
+model = DDP(model, device_ids=[device])
 
 
 # load tokens
-train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, 0, 1)
-val_loader = DistributedDataLoader("fineweb10B/fineweb_val_*.bin", B, T, 0, 1)
+train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, rank, world_size)
 
 LEARNING_RATE = 1e-4
 LEARNING_RATE_DECAY_FRAC = 0.0
 WEIGHT_DECAY = 0.1
 WARMUP_ITERS = 0
 NUM_ITERATIONS = 20000
-VAL_LOSS_EVERY = 100
-VAL_MAX_STEPS = 20
-EVAL_EVERY = 500
 GRAD_ACCUM_STEPS = 50
 GRAD_CLIP = 1.0
 
@@ -165,39 +167,13 @@ def get_lr(it):
     )  # coeff starts at 1 and goes to 0
     return min_lr + coeff * (LEARNING_RATE - min_lr)
 
+ctx = torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
+
 
 timings = []
 norm = -1.0  # dummy value to print in inference-only mode
 for step in range(NUM_ITERATIONS + 1):
     t0 = time.time()
-    last_step = step == NUM_ITERATIONS
-
-    # once in a while evaluate the validation dataset
-    if (step % VAL_LOSS_EVERY == 0 or last_step) and (val_loader is not None):
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss = 0.0
-            for _ in range(VAL_MAX_STEPS):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                _, loss = model(x, y)
-                val_loss += loss.item()
-            val_loss /= VAL_MAX_STEPS
-        # log to console and to file
-        print(f"val loss {val_loss}")
-
-    if step % EVAL_EVERY == 0:
-        acc, acc_norm = evaluate(model, device)
-        print(f"acc: {acc:.4f} acc_norm: {acc_norm:.4f}")
-
-    # bit confusing: we want to make sure to eval and sample on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
-    if last_step:
-        break
-
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     optimizer.zero_grad(set_to_none=True)
