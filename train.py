@@ -6,6 +6,7 @@ import os
 import numpy as np
 import tiktoken
 import torch
+from torch.distributed import init_process_group
 from model import GPT
 from hellaswag import evaluate
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -105,6 +106,8 @@ class DistributedDataLoader:
 # args error checking and convenience variables
 B, T = 10, 1024
 assert 1 <= T <= 1024
+
+init_process_group()
 
 rank = int(os.environ.get("LOCAL_RANK"))
 world_size = int(os.environ.get("WORLD_SIZE"))
