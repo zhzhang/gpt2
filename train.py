@@ -121,7 +121,7 @@ enc = tiktoken.get_encoding("gpt2")
 
 device = "cpu"
 if torch.cuda.is_available():
-    device = "cuda"
+    device = f"cuda:{rank}"
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
@@ -133,7 +133,9 @@ model = DDP(model, device_ids=[device])
 
 
 # load tokens
-train_loader = DistributedDataLoader("fineweb10B/fineweb_train_*.bin", B, T, rank, world_size)
+train_loader = DistributedDataLoader(
+    "fineweb10B/fineweb_train_*.bin", B, T, rank, world_size
+)
 
 LEARNING_RATE = 1e-4
 LEARNING_RATE_DECAY_FRAC = 0.0
@@ -170,7 +172,6 @@ def get_lr(it):
     return min_lr + coeff * (LEARNING_RATE - min_lr)
 
 
-
 timings = []
 norm = -1.0  # dummy value to print in inference-only mode
 
@@ -181,14 +182,16 @@ with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
-        lossf = (
-            0.0  # for getting the mean loss (as simple float) over the accumulation steps
-        )
+        lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
         total_toks = 0
         for micro_step in range(GRAD_ACCUM_STEPS):
             # fetch a batch
             x, y = train_loader.next_batch()
+
             x, y = x.to(device), y.to(device)
+            if step == 0 and micro_step == 0:
+                decoded = enc.decode(x[0].cpu().tolist())
+                print(f"rank {rank} first example: {decoded}")
             # forward pass
             _, loss = model(x, y)
             total_toks += x.size(0) * x.size(1)
@@ -198,6 +201,7 @@ with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
             # instead of a SUM we want MEAN, so we scale the loss here
             loss = loss / GRAD_ACCUM_STEPS
             lossf += loss.detach()  # keep track of the mean loss
+            print(f"rank: {rank}, loss: {loss.item()}")
             # backward pass
             loss.backward()
         lossf = lossf.item()
@@ -214,9 +218,10 @@ with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
-        print(
-            f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
-        )
+        if rank == 0:
+            print(
+                f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
+            )
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > NUM_ITERATIONS - 20:
