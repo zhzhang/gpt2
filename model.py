@@ -1,5 +1,4 @@
 import math
-import time
 from typing import Optional
 import torch
 from torch import nn
@@ -142,8 +141,11 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, context_length: int):
+    def __init__(
+        self, d_model: int, n_heads: int, context_length: int, cached: bool = False
+    ):
         super().__init__()
+        self.cached = cached
         self.layer_norm_1 = nn.LayerNorm(d_model)
         self.attention = AttentionHead(d_model, n_heads, context_length)
         self.layer_norm_2 = nn.LayerNorm(d_model)
@@ -151,7 +153,7 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
-        x = self.attention(self.layer_norm_1(x)) + x
+        x = self.attention(self.layer_norm_1(x), cached=self.cached) + x
         x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 
@@ -256,51 +258,6 @@ class GPT(nn.Module):
         print("using regular AdamW")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        first_token = True
-        prefill_time = None
-        generation_time = 0
-        for _ in range(max_new_tokens):
-            start_time = time.time()
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = (
-                idx
-                if idx.size(1) <= self.context_length
-                else idx[:, -self.context_length :]
-            )
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-            elapsed_time = time.time() - start_time
-            if first_token:
-                prefill_time = elapsed_time
-                first_token = False
-            else:
-                generation_time += elapsed_time
-
-        print(f"Prefill time: {1000 * prefill_time} ms")
-        print(f"Generation time: {1000 * generation_time} ms")
-        print(f"Time per token: {1000 * generation_time / (max_new_tokens - 1)} ms ")
-
-        return idx
 
     @classmethod
     def from_pretrained(cls, _sdf=None):
