@@ -91,5 +91,5 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     input_text = "Once upon a time, there was a boy who"
     tokens = torch.tensor(enc.encode(input_text)).unsqueeze(0)
-    output = generate(model, tokens, max_new_tokens=256)
+    output = generate(model, tokens, max_new_tokens=1000, cached=True)
     print(enc.decode(output[0].tolist()))
