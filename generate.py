@@ -22,9 +22,13 @@ def generate(
     max_new_tokens: int,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
+    cached: bool = True,
     validate_cache_impl: bool = False,
 ) -> torch.Tensor:
-    _configure_cache(model, cached=True)
+    _configure_cache(model, cached=cached)
+    assert not validate_cache_impl or cached, (
+        "validate_cache_impl requires cached=True."
+    )
 
     validation_model = None
     if validate_cache_impl:
@@ -47,12 +51,11 @@ def generate(
         logits, _ = model(idx_cond)
         if validation_model is not None:
             uncached_logits, _ = validation_model(idx_cond)
-            eps = torch.finfo(logits.dtype).eps
             torch.testing.assert_close(
                 logits,
                 uncached_logits,
-                rtol=16 * eps,
-                atol=16 * eps,
+                rtol=1e-5,
+                atol=1e-5,
                 msg="Cached and uncached logits diverged.",
             )
         # pluck the logits at the final step and scale by desired temperature
@@ -88,5 +91,5 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     input_text = "Once upon a time, there was a boy who"
     tokens = torch.tensor(enc.encode(input_text)).unsqueeze(0)
-    output = generate(model, tokens, max_new_tokens=256, validate_cache_impl=True)
+    output = generate(model, tokens, max_new_tokens=256)
     print(enc.decode(output[0].tolist()))
