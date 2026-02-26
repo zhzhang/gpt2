@@ -1,4 +1,5 @@
 import time
+import copy
 
 import tiktoken
 import torch
@@ -8,6 +9,12 @@ from typing import Optional
 from model import GPT
 
 
+def _configure_cache(model: GPT, cached: bool) -> None:
+    for block in model.blocks:
+        block.cached = cached
+        block.attention.cache = None
+
+
 @torch.no_grad()
 def generate(
     model: GPT,
@@ -15,12 +22,15 @@ def generate(
     max_new_tokens: int,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
-    cached: bool = True,
+    validate_cache_impl: bool = False,
 ) -> torch.Tensor:
-    # Reset stale KV cache at generation start.
-    if cached:
-        for block in model.blocks:
-            block.attention.cache = None
+    _configure_cache(model, cached=True)
+
+    validation_model = None
+    if validate_cache_impl:
+        validation_model = copy.deepcopy(model)
+        validation_model.eval()
+        _configure_cache(validation_model, cached=False)
 
     first_token = True
     prefill_time = None
@@ -34,7 +44,17 @@ def generate(
             else idx[:, -model.context_length :]
         )
         # forward the model to get the logits for the index in the sequence
-        logits, _ = model(idx_cond, cached=cached)
+        logits, _ = model(idx_cond)
+        if validation_model is not None:
+            uncached_logits, _ = validation_model(idx_cond)
+            eps = torch.finfo(logits.dtype).eps
+            torch.testing.assert_close(
+                logits,
+                uncached_logits,
+                rtol=16 * eps,
+                atol=16 * eps,
+                msg="Cached and uncached logits diverged.",
+            )
         # pluck the logits at the final step and scale by desired temperature
         logits = logits[:, -1, :] / temperature
         # optionally crop the logits to only the top k options
@@ -68,5 +88,5 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     input_text = "Once upon a time, there was a boy who"
     tokens = torch.tensor(enc.encode(input_text)).unsqueeze(0)
-    output = generate(model, tokens, max_new_tokens=256)
+    output = generate(model, tokens, max_new_tokens=256, validate_cache_impl=True)
     print(enc.decode(output[0].tolist()))
