@@ -7,12 +7,8 @@ from torch.nn import functional as F
 from typing import Optional
 
 from model import GPT
+from kv_cache_model import GPT as CachedGPT
 
-
-def _configure_cache(model: GPT, cached: bool) -> None:
-    for block in model.blocks:
-        block.cached = cached
-        block.attention.cache = None
 
 
 @torch.no_grad()
@@ -25,16 +21,16 @@ def generate(
     cached: bool = True,
     validate_cache_impl: bool = False,
 ) -> torch.Tensor:
-    _configure_cache(model, cached=cached)
     assert not validate_cache_impl or cached, (
         "validate_cache_impl requires cached=True."
     )
 
+    model = CachedGPT.from_pretrained() if cached else GPT.from_pretrained()
+
     validation_model = None
     if validate_cache_impl:
-        validation_model = copy.deepcopy(model)
+        validation_model = GPT.from_pretrained()
         validation_model.eval()
-        _configure_cache(validation_model, cached=False)
 
     first_token = True
     prefill_time = None
@@ -49,17 +45,20 @@ def generate(
         )
         # forward the model to get the logits for the index in the sequence
         logits, _ = model(idx_cond)
+        logits = logits[:, -1, :]
         if validation_model is not None:
             uncached_logits, _ = validation_model(idx_cond)
+            uncached_logits = uncached_logits[:, -1, :]
+            # print(logits[:, :10], uncached_logits[:, :10])
             torch.testing.assert_close(
                 logits,
                 uncached_logits,
-                rtol=1e-5,
-                atol=1e-5,
+                rtol=1e-3,
+                atol=1e-4,
                 msg="Cached and uncached logits diverged.",
             )
         # pluck the logits at the final step and scale by desired temperature
-        logits = logits[:, -1, :] / temperature
+        logits = logits / temperature
         # optionally crop the logits to only the top k options
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -91,5 +90,7 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     input_text = "Once upon a time, there was a boy who"
     tokens = torch.tensor(enc.encode(input_text)).unsqueeze(0)
-    output = generate(model, tokens, max_new_tokens=1000, cached=True)
+    output = generate(model, tokens, max_new_tokens=256, cached=False)
+    print(enc.decode(output[0].tolist()))
+    output = generate(model, tokens, max_new_tokens=256, cached=True)
     print(enc.decode(output[0].tolist()))

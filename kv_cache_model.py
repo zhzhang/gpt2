@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 class AttentionHead(nn.Module):
     PRINTED = False
+
     def __init__(self, d_model: int, n_heads: int, context_length: int):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -28,60 +29,29 @@ class AttentionHead(nn.Module):
         )
         self.cache = None
 
-    def cached_forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, _sequence_length, d_model = x.size()
-        if self.cache is None:
-            # Prefill
-            output, (k, v) = self.forward(x, return_kv=True, cached=False)
-            self.cache = (k, v, output)
-            return output
-        cached_k, cached_v, cached_output = self.cache
-        new_x = x[:, -1:, :]
-        new_x = self.input_projection(new_x)
-        new_q, new_k, new_v = new_x.split(d_model, dim=2)
-        new_q = new_q.view(
-            batch_size, 1, self.n_heads, d_model // self.n_heads
-        ).transpose(1, 2)
-        new_k = new_k.view(
-            batch_size, 1, self.n_heads, d_model // self.n_heads
-        ).transpose(1, 2)
-        new_v = new_v.view(
-            batch_size, 1, self.n_heads, d_model // self.n_heads
-        ).transpose(1, 2)
-        k = torch.cat([cached_k, new_k], dim=2) if cached_k is not None else new_k
-        v = torch.cat([cached_v, new_v], dim=2) if cached_v is not None else new_v
-        new_attn = (new_q @ k.transpose(-2, -1)) / math.sqrt(d_model // self.n_heads)
-        new_attn = new_attn.softmax(dim=-1)
-        new_attn = new_attn @ v
-        new_output = new_attn.transpose(1, 2).contiguous().view(batch_size, 1, d_model)
-        new_output = self.output_projection(new_output)
-        output = (
-            torch.cat([cached_output, new_output], dim=1)
-            if cached_output is not None
-            else new_output
-        )
-        self.cache = (k, v, output)
-        return output
 
     def forward(
-        self, x: torch.Tensor, cached: bool = True, return_kv: bool = False
+        self, x: torch.Tensor
     ) -> torch.Tensor:
-        if cached:
-            return self.cached_forward(x)
-
         # X shape is (batch_size, sequence_length, d_model)
-        batch_size, sequence_length, d_model = x.size()
         # (batch_size, sequence_length, 3 * d_model)
         x = self.input_projection(x)
         # Each of q, k, v is (batch_size, sequence_length, n_dim)
-        q, k, v = x.split(d_model, dim=2)
+        q, k, v = x.split(self.d_model, dim=2)
+        if self.cache:
+            prev_k, prev_v = self.cache
+            k = torch.concat([prev_k, k], dim=1)
+            v = torch.concat([prev_v, v], dim=1)
+        batch_size, sequence_length, d_model = k.size()
+        query_length = 1 if self.cache else sequence_length
+        self.cache = (k, v)
         # Allocate slices of q, k, v for each head.
         # A linear map from d_input -> d_head is the same as a linear map from
         # d_input -> d_input because that linear map is just a stack of matrices
         # of size d_input x (d_input / n_heads) so long as there is divisibility.
         # Each of q, k, v is now (batch_size, sequence_length, n_heads, d_head)
         # where d_head = d_model / n_heads
-        q = q.view(batch_size, sequence_length, self.n_heads, d_model // self.n_heads)
+        q = q.view(batch_size, query_length, self.n_heads, d_model // self.n_heads)
         k = k.view(batch_size, sequence_length, self.n_heads, d_model // self.n_heads)
         v = v.view(batch_size, sequence_length, self.n_heads, d_model // self.n_heads)
         # Swap the sequence length and head dimensions, as we are trying to end up with a sequence_length x sequence_length matrix.
@@ -93,20 +63,19 @@ class AttentionHead(nn.Module):
         # Scale the attention scores by 1 / sqrt(d_model)
         # TODO: what happens if we put the scale after the mask?
         attn = attn / math.sqrt(d_model // self.n_heads)
-        attn = attn.masked_fill(
-            self.mask[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
-        )
+        if query_length > 1:
+            attn = attn.masked_fill(
+                self.mask[:, :, :sequence_length, :sequence_length] == 0, float("-inf")
+            )
         # TODO: see if this softmax is in the right dimension.
         attn = attn.softmax(dim=-1)
         # (batch_size, n_heads, sequence_length, d_head)
         attn = attn @ v
         # Swap back the sequence length and head dimensions.
         output = (
-            attn.transpose(1, 2).contiguous().view(batch_size, sequence_length, d_model)
+            attn.transpose(1, 2).contiguous().view(batch_size, query_length, d_model)
         )
         output = self.output_projection(output)
-        if return_kv:
-            return output, (k, v)
         return output
 
 
@@ -143,10 +112,9 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
     def __init__(
-        self, d_model: int, n_heads: int, context_length: int, cached: bool = False
+        self, d_model: int, n_heads: int, context_length: int
     ):
         super().__init__()
-        self.cached = cached
         self.layer_norm_1 = nn.LayerNorm(d_model)
         self.attention = AttentionHead(d_model, n_heads, context_length)
         self.layer_norm_2 = nn.LayerNorm(d_model)
@@ -154,7 +122,7 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
-        x = self.attention(self.layer_norm_1(x), cached=self.cached) + x
+        x = self.attention(self.layer_norm_1(x)) + x
         x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 
@@ -186,6 +154,7 @@ class GPT(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
         self.apply(self._init_weights)
+        self.prefilled = False
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -217,6 +186,8 @@ class GPT(nn.Module):
             torch.arange(idx.size(1), dtype=torch.long, device=idx.device)
         )
         x = token_embeds + position_embeds
+        if self.prefilled:
+            x = x[:, -1:]
 
         for i, block in enumerate(self.blocks):
             x = block(x)
@@ -229,6 +200,8 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
+
+        self.prefilled = True
 
         return logits, loss
 
