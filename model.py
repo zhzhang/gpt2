@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Optional
 import torch
 from torch import nn
@@ -25,8 +26,49 @@ class AttentionHead(nn.Module):
                 1, 1, context_length, context_length
             ),
         )
+        self.cache = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def cached_forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, _sequence_length, d_model = x.size()
+        if self.cache is None:
+            # Prefill
+            output, (k, v) = self.forward(x, return_kv=True, cached=False)
+            self.cache = (k, v, output)
+            return output
+        cached_k, cached_v, cached_output = self.cache
+        new_x = x[:, -1:, :]
+        new_x = self.input_projection(new_x)
+        new_q, new_k, new_v = new_x.split(d_model, dim=2)
+        new_q = new_q.view(
+            batch_size, 1, self.n_heads, d_model // self.n_heads
+        ).transpose(1, 2)
+        new_k = new_k.view(
+            batch_size, 1, self.n_heads, d_model // self.n_heads
+        ).transpose(1, 2)
+        new_v = new_v.view(
+            batch_size, 1, self.n_heads, d_model // self.n_heads
+        ).transpose(1, 2)
+        k = torch.cat([cached_k, new_k], dim=2) if cached_k is not None else new_k
+        v = torch.cat([cached_v, new_v], dim=2) if cached_v is not None else new_v
+        new_attn = (new_q @ k.transpose(-2, -1)) / math.sqrt(d_model // self.n_heads)
+        new_attn = new_attn.softmax(dim=-1)
+        new_attn = new_attn @ v
+        new_output = new_attn.transpose(1, 2).contiguous().view(batch_size, 1, d_model)
+        new_output = self.output_projection(new_output)
+        output = (
+            torch.cat([cached_output, new_output], dim=1)
+            if cached_output is not None
+            else new_output
+        )
+        self.cache = (k, v, output)
+        return output
+
+    def forward(
+        self, x: torch.Tensor, cached: bool = True, return_kv: bool = False
+    ) -> torch.Tensor:
+        if cached:
+            return self.cached_forward(x)
+
         # X shape is (batch_size, sequence_length, d_model)
         batch_size, sequence_length, d_model = x.size()
         # (batch_size, sequence_length, 3 * d_model)
@@ -63,6 +105,8 @@ class AttentionHead(nn.Module):
             attn.transpose(1, 2).contiguous().view(batch_size, sequence_length, d_model)
         )
         output = self.output_projection(output)
+        if return_kv:
+            return output, (k, v)
         return output
 
 
@@ -220,7 +264,11 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        first_token = True
+        prefill_time = None
+        generation_time = 0
         for _ in range(max_new_tokens):
+            start_time = time.time()
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = (
                 idx
@@ -241,6 +289,16 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+            elapsed_time = time.time() - start_time
+            if first_token:
+                prefill_time = elapsed_time
+                first_token = False
+            else:
+                generation_time += elapsed_time
+
+        print(f"Prefill time: {1000 * prefill_time} ms")
+        print(f"Generation time: {1000 * generation_time} ms")
+        print(f"Time per token: {1000 * generation_time / (max_new_tokens - 1)} ms ")
 
         return idx
 
