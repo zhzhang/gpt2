@@ -75,7 +75,7 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input(x)
-        x = self.gelu(x) 
+        x = self.gelu(x)
 
 
 class SwiGLU(nn.Module):
@@ -94,7 +94,8 @@ class SwiGLU(nn.Module):
 
 class Block(nn.Module):
     def __init__(
-        self, config: ModelConfig,
+        self,
+        config: ModelConfig,
     ):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(config.d_model)
@@ -114,13 +115,8 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
 
-        self.token_embedding = nn.Embedding(50257, self.d_model)
-        self.blocks = nn.ModuleList(
-            [
-                Block(config)
-                for _ in range(config.n_layers)
-            ]
-        )
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         # Ties the token embedding and the output projection.
