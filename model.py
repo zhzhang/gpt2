@@ -26,7 +26,9 @@ class AttentionHead(nn.Module):
         )
         self.config = config
 
-        self.kv_dim = config.d_model // config.n_attn_groups
+        self.total_q = config.n_q_per_group * config.n_attn_groups
+        self.d_head = config.d_model // self.total_q
+        self.kv_dim = config.n_attn_groups * self.d_head
         self.input_projection = nn.Linear(
             config.d_model, config.d_model + 2 * self.kv_dim
         )
@@ -39,18 +41,16 @@ class AttentionHead(nn.Module):
         batch_size, sequence_length, _ = x.size()
         # (batch_size, sequence_length, 3 * d_model)
         x = self.input_projection(x)
-        total_q = config.n_q_per_group * config.n_attn_groups
-        head_dim = config.d_model // total_q
         q, k, v = x.split([config.d_model, self.kv_dim, self.kv_dim], dim=2)
         # Allocate slices of q, k, v for each head.
         q = q.view(
             batch_size,
             sequence_length,
             config.n_attn_groups * config.n_q_per_group,
-            head_dim,
+            self.d_head,
         )
-        k = k.view(batch_size, sequence_length, config.n_attn_groups, head_dim)
-        v = v.view(batch_size, sequence_length, config.n_attn_groups, head_dim)
+        k = k.view(batch_size, sequence_length, config.n_attn_groups, self.d_head)
+        v = v.view(batch_size, sequence_length, config.n_attn_groups, self.d_head)
         # Swap the sequence length and head dimensions, as we are trying to end up with a sequence_length x sequence_length matrix.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -202,3 +202,17 @@ class Model(nn.Module):
         print("using regular AdamW")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
+
+
+if __name__ == "__main__":
+    config = ModelConfig(
+        d_model=768,
+        n_attn_groups=8,
+        n_q_per_group=32,
+        n_layers=12,
+        context_length=1024,
+        vocab_size=50257,
+    )
+    attn = AttentionHead(config)
+    x = torch.randn(1, 1024, 768)
+    y = attn(x)
