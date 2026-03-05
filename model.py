@@ -70,17 +70,6 @@ class AttentionHead(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
-        self.input = nn.Linear(d_model, d_model / 2)
-        self.output = nn.Linear(d_model / 2, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input(x)
-        x = self.gelu(x)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
         self.input = nn.Linear(d_model, 2 * d_model)
         self.output = nn.Linear(d_model, d_model)
 
@@ -206,13 +195,17 @@ class Model(nn.Module):
 
 if __name__ == "__main__":
     config = ModelConfig(
-        d_model=768,
-        n_attn_groups=8,
-        n_q_per_group=32,
+        d_model=1024,
+        n_attn_groups=4,
+        n_q_per_group=4,
         n_layers=12,
         context_length=1024,
         vocab_size=50257,
     )
-    attn = AttentionHead(config)
-    x = torch.randn(1, 1024, 768)
-    y = attn(x)
+    model = Model(config)
+    model.configure_optimizers(
+        weight_decay=0.1,
+        learning_rate=1e-4,
+        betas=(0.9, 0.95),
+        zero_stage=0,
+    )
