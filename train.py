@@ -207,7 +207,6 @@ with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
             # instead of a SUM we want MEAN, so we scale the loss here
             loss = loss / GRAD_ACCUM_STEPS
             lossf += loss.detach()  # keep track of the mean loss
-            print(f"rank: {rank}, loss: {loss.item()}")
             # backward pass
             loss.backward()
         lossf = lossf.item()
