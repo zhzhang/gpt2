@@ -81,6 +81,38 @@ class SwiGLU(nn.Module):
         return x
 
 
+class NewGELU(nn.Module):
+    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
+
+    def forward(self, input):
+        return (
+            0.5
+            * input
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi)
+                    * (input + 0.044715 * torch.pow(input, 3.0))
+                )
+            )
+        )
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.d_model, 4 * config.d_model)
+        self.gelu = NewGELU()
+        self.c_proj = nn.Linear(4 * config.d_model, config.d_model)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -90,7 +122,8 @@ class Block(nn.Module):
         self.layer_norm_1 = nn.LayerNorm(config.d_model)
         self.attention = AttentionHead(config)
         self.layer_norm_2 = nn.LayerNorm(config.d_model)
-        self.feed_forward = SwiGLU(config.d_model)
+        # self.feed_forward = SwiGLU(config.d_model)
+        self.feed_forward = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
