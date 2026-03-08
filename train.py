@@ -1,13 +1,14 @@
-import time
+import argparse
 import glob
 import math
 import os
+import time
+from contextlib import nullcontext
 
 import numpy as np
-import tiktoken
 import torch
-from torch.distributed import init_process_group, destroy_process_group
 from model import Model, ModelConfig
+from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
@@ -102,134 +103,207 @@ class DistributedDataLoader:
         return x, y
 
 
-# args error checking and convenience variables
-B, T = 10, 1024
-assert 1 <= T <= 1024
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train GPT-style model.")
+    parser.add_argument("--train-bin-pattern", type=str, default="fineweb10B/fineweb_train_*.bin")
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate-decay-frac", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--warmup-iters", type=int, default=0)
+    parser.add_argument("--num-iterations", type=int, default=20000)
+    parser.add_argument("--grad-accum-steps", type=int, default=50)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--d-model", type=int, default=768)
+    parser.add_argument("--n-kv-heads", type=int, default=12)
+    parser.add_argument("--n-q-heads", type=int, default=12)
+    parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--context-length", type=int, default=1024)
+    parser.add_argument("--vocab-size", type=int, default=50257)
+    parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="gpt2-training")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-log-interval", type=int, default=1)
+    return parser.parse_args()
 
-init_process_group()
 
-rank = int(os.environ.get("LOCAL_RANK"))
-world_size = int(os.environ.get("WORLD_SIZE"))
+def train(args):
+    assert 1 <= args.seq_len <= args.context_length
+    assert args.grad_accum_steps > 0
+    assert args.num_iterations >= 0
+    assert args.wandb_log_interval > 0
 
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    world_size_env = os.environ.get("WORLD_SIZE")
+    is_distributed = local_rank_env is not None and world_size_env is not None
 
-# rng / reproducibility
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+    if is_distributed:
+        init_process_group()
+        rank = int(local_rank_env)
+        world_size = int(world_size_env)
+    else:
+        rank = 0
+        world_size = 1
 
-enc = tiktoken.get_encoding("gpt2")
+    # rng / reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = f"cuda:{rank}"
+    if torch.cuda.is_available():
+        device = f"cuda:{rank}"
+        device_type = "cuda"
+    else:
+        device = "cpu"
+        device_type = "cpu"
 
-# init the model, either from scratch or from OpenAI pretrained checkpoint
+    wandb_run = None
+    should_log_wandb = args.wandb and rank == 0
+    if should_log_wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError(
+                "Weights & Biases is enabled but not installed. Install with `pip install wandb`."
+            ) from exc
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
 
-model = Model(
-    ModelConfig(
-        d_model=768,
-        n_kv_heads=12,
-        n_q_heads=12,
-        n_layers=12,
-        context_length=1024,
-        vocab_size=50257,
+    # init the model, either from scratch or from OpenAI pretrained checkpoint
+    model = Model(
+        ModelConfig(
+            d_model=args.d_model,
+            n_kv_heads=args.n_kv_heads,
+            n_q_heads=args.n_q_heads,
+            n_layers=args.n_layers,
+            context_length=args.context_length,
+            vocab_size=args.vocab_size,
+        )
     )
-)
-model.train()
-model.to(device)
-model = torch.compile(model)
-model = DDP(model, device_ids=[device])
+    model.train()
+    model.to(device)
+    if not args.no_compile:
+        model = torch.compile(model)
+
+    if is_distributed:
+        if device_type == "cuda":
+            model = DDP(model, device_ids=[rank])
+        else:
+            model = DDP(model)
+
+    # load tokens
+    train_loader = DistributedDataLoader(
+        args.train_bin_pattern, args.batch_size, args.seq_len, rank, world_size
+    )
+
+    # init the optimizer
+    model_for_optim = model.module if is_distributed else model
+    optimizer = model_for_optim.configure_optimizers(
+        weight_decay=args.weight_decay,
+        learning_rate=args.learning_rate,
+        betas=(0.9, 0.95),
+        zero_stage=0,
+    )
+
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        min_lr = args.learning_rate * args.learning_rate_decay_frac
+        # 1) linear warmup for warmup_iters steps
+        if args.warmup_iters > 0 and it < args.warmup_iters:
+            return args.learning_rate * (it + 1) / args.warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.num_iterations:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        denom = max(args.num_iterations - args.warmup_iters, 1)
+        decay_ratio = (it - args.warmup_iters) / denom
+        decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+        coeff = 0.5 * (
+            1.0 + math.cos(math.pi * decay_ratio)
+        )  # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (args.learning_rate - min_lr)
+
+    timings = []
+    norm = -1.0  # dummy value to print in inference-only mode
+    autocast_context = (
+        torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+        if device_type == "cuda"
+        else nullcontext()
+    )
+
+    try:
+        with autocast_context:
+            for step in range(args.num_iterations + 1):
+                t0 = time.time()
+                # --------------- TRAINING SECTION BEGIN -----------------
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                # micro-batch loop where we do gradient accumulation to reach desired total batch size
+                lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
+                total_toks = 0
+                for micro_step in range(args.grad_accum_steps):
+                    # fetch a batch
+                    x, y = train_loader.next_batch()
+
+                    x, y = x.to(device), y.to(device)
+                    # forward pass
+                    _, loss = model(x, y)
+                    total_toks += x.size(0) * x.size(1)
+                    # we have to scale the loss to account for gradient accumulation,
+                    # because the gradients just add on each successive backward().
+                    # addition of gradients corresponds to a SUM in the objective, but
+                    # instead of a SUM we want MEAN, so we scale the loss here
+                    loss = loss / args.grad_accum_steps
+                    lossf += loss.detach()  # keep track of the mean loss
+                    # backward pass
+                    loss.backward()
+                lossf = lossf.item()
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                # determine and set the learning rate for this iteration
+                lr = get_lr(step)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
+                # step the optimizer
+                optimizer.step()
+                # --------------- TRAINING SECTION END -------------------
+                # everything that follows now is just diagnostics, prints, logging, etc.
+
+                # time and print
+                t1 = time.time()
+                # the 0th iteration is often an outlier (much slower) => skip logging it
+                if rank == 0:
+                    print(
+                        f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
+                    )
+                    if wandb_run is not None and ((step + 1) % args.wandb_log_interval == 0):
+                        wandb_run.log(
+                            {
+                                "train/loss": lossf,
+                                "train/norm": float(norm),
+                                "train/lr": lr,
+                                "train/iter_ms": (t1 - t0) * 1000.0,
+                                "train/toks_per_s": total_toks / (t1 - t0),
+                            },
+                            step=step + 1,
+                        )
+
+                # keep track of smooth timings, last 20 iterations
+                if step > 0 and step > args.num_iterations - 20:
+                    timings.append(t1 - t0)
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+        if is_distributed:
+            destroy_process_group()
 
 
-# load tokens
-train_loader = DistributedDataLoader(
-    "fineweb10B/fineweb_train_*.bin", B, T, rank, world_size
-)
-
-LEARNING_RATE = 1e-4
-LEARNING_RATE_DECAY_FRAC = 0.0
-WEIGHT_DECAY = 0.1
-WARMUP_ITERS = 0
-NUM_ITERATIONS = 20000
-GRAD_ACCUM_STEPS = 50
-GRAD_CLIP = 1.0
-
-# init the optimizer
-optimizer = model.module.configure_optimizers(
-    weight_decay=WEIGHT_DECAY,
-    learning_rate=LEARNING_RATE,
-    betas=(0.9, 0.95),
-    zero_stage=0,
-)
-
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    min_lr = LEARNING_RATE * LEARNING_RATE_DECAY_FRAC
-    # 1) linear warmup for warmup_iters steps
-    if it < WARMUP_ITERS:
-        return LEARNING_RATE * (it + 1) / WARMUP_ITERS
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > NUM_ITERATIONS:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - WARMUP_ITERS) / (NUM_ITERATIONS - WARMUP_ITERS)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (
-        1.0 + math.cos(math.pi * decay_ratio)
-    )  # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (LEARNING_RATE - min_lr)
-
-
-timings = []
-norm = -1.0  # dummy value to print in inference-only mode
-
-with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
-    for step in range(NUM_ITERATIONS + 1):
-        t0 = time.time()
-        # --------------- TRAINING SECTION BEGIN -----------------
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        # micro-batch loop where we do gradient accumulation to reach desired total batch size
-        lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
-        total_toks = 0
-        for micro_step in range(GRAD_ACCUM_STEPS):
-            # fetch a batch
-            x, y = train_loader.next_batch()
-
-            x, y = x.to(device), y.to(device)
-            # forward pass
-            _, loss = model(x, y)
-            total_toks += x.size(0) * x.size(1)
-            # we have to scale the loss to account for gradient accumulation,
-            # because the gradients just add on each successive backward().
-            # addition of gradients corresponds to a SUM in the objective, but
-            # instead of a SUM we want MEAN, so we scale the loss here
-            loss = loss / GRAD_ACCUM_STEPS
-            lossf += loss.detach()  # keep track of the mean loss
-            # backward pass
-            loss.backward()
-        lossf = lossf.item()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-        # step the optimizer
-        optimizer.step()
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
-
-        # time and print
-        t1 = time.time()
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        if rank == 0:
-            print(
-                f"step {step + 1:4d}/{NUM_ITERATIONS} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
-            )
-
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > NUM_ITERATIONS - 20:
-            timings.append(t1 - t0)
-
-destroy_process_group()
+if __name__ == "__main__":
+    train(parse_args())
