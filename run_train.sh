@@ -5,6 +5,8 @@ uv run torchrun --standalone --nproc_per_node=1 train.py \
 --wandb-project tiny-lms \
 --wandb-run-name gqa-gpt2-size \
 --wandb-log-interval 10 \
+--n-kv-heads 3 \
+--n-layers 12 \
 --val-every 250 \
 --num-iterations 2500 \
 --batch-size 64 \
