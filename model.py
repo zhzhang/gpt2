@@ -233,9 +233,9 @@ class Model(nn.Module):
 if __name__ == "__main__":
     config = ModelConfig(
         d_model=768,
-        n_kv_heads=12,
+        n_kv_heads=3,
         n_q_heads=12,
-        n_layers=12,
+        n_layers=14,
         context_length=1024,
         vocab_size=50257,
     )
