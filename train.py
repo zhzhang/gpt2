@@ -196,6 +196,80 @@ def evaluate_hellaswag(model, device, rank, world_size):
     return acc, acc_norm
 
 
+def _run_hellaswag_eval_if_needed(
+    *,
+    step,
+    args,
+    model,
+    device,
+    rank,
+    world_size,
+    wandb_run,
+):
+    if args.eval_every <= 0 or (step + 1) % args.eval_every != 0:
+        return
+
+    model.eval()
+    eval_t0 = time.time()
+    hs_acc, hs_acc_norm = evaluate_hellaswag(
+        model=model,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+    )
+    eval_t1 = time.time()
+
+    if rank == 0:
+        print(
+            f"step {step + 1:4d}/{args.num_iterations} | hellaswag acc {hs_acc:.4f} | hellaswag acc_norm {hs_acc_norm:.4f} | ({(eval_t1 - eval_t0):.2f} s)"
+        )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "hellaswag/acc": hs_acc,
+                    "hellaswag/acc_norm": hs_acc_norm,
+                },
+                step=step + 1,
+            )
+
+
+def _save_checkpoint_if_needed(
+    *,
+    step,
+    args,
+    rank,
+    checkpoint_run_name,
+    model,
+    is_distributed,
+    optimizer,
+):
+    if args.checkpoint_every <= 0 or (step + 1) % args.checkpoint_every != 0:
+        return
+    if rank != 0:
+        return
+
+    step_num = step + 1
+    if checkpoint_run_name is not None:
+        checkpoint_path = f"checkpoints/{checkpoint_run_name}/step_{step_num:06d}.pt"
+    else:
+        checkpoint_path = f"checkpoints/checkpoint_step_{step_num:06d}.pt"
+
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    checkpoint_model = model.module if is_distributed else model
+    checkpoint_model = getattr(checkpoint_model, "_orig_mod", checkpoint_model)
+    checkpoint = {
+        "step": step_num,
+        "model_state_dict": checkpoint_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(
+        f"step {step_num:4d}/{args.num_iterations} | saved checkpoint {checkpoint_path}"
+    )
+
+
 def train(args):
     assert 1 <= args.seq_len <= args.max_sequence_length
     assert args.grad_accum_steps > 0
@@ -408,54 +482,25 @@ def train(args):
                         if wandb_run is not None:
                             wandb_run.log({"val/loss": val_loss_mean}, step=step + 1)
 
-                if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
-                    model.eval()
-                    eval_t0 = time.time()
-                    hs_acc, hs_acc_norm = evaluate_hellaswag(
-                        model=model,
-                        device=device,
-                        rank=rank,
-                        world_size=world_size,
-                    )
-                    eval_t1 = time.time()
-                    if rank == 0:
-                        print(
-                            f"step {step + 1:4d}/{args.num_iterations} | hellaswag acc {hs_acc:.4f} | hellaswag acc_norm {hs_acc_norm:.4f} | ({(eval_t1 - eval_t0):.2f} s)"
-                        )
-                        if wandb_run is not None:
-                            wandb_run.log(
-                                {
-                                    "hellaswag/acc": hs_acc,
-                                    "hellaswag/acc_norm": hs_acc_norm,
-                                },
-                                step=step + 1,
-                            )
+                _run_hellaswag_eval_if_needed(
+                    step=step,
+                    args=args,
+                    model=model,
+                    device=device,
+                    rank=rank,
+                    world_size=world_size,
+                    wandb_run=wandb_run,
+                )
 
-                if args.checkpoint_every > 0 and (
-                    (step + 1) % args.checkpoint_every == 0
-                ):
-                    if rank == 0:
-                        step_num = step + 1
-                        if checkpoint_run_name is not None:
-                            checkpoint_path = f"checkpoints/{checkpoint_run_name}/step_{step_num:06d}.pt"
-                        else:
-                            checkpoint_path = (
-                                f"checkpoints/checkpoint_step_{step_num:06d}.pt"
-                            )
-                        checkpoint_model = model.module if is_distributed else model
-                        checkpoint_model = getattr(
-                            checkpoint_model, "_orig_mod", checkpoint_model
-                        )
-                        checkpoint = {
-                            "step": step_num,
-                            "model_state_dict": checkpoint_model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "args": vars(args),
-                        }
-                        torch.save(checkpoint, checkpoint_path)
-                        print(
-                            f"step {step_num:4d}/{args.num_iterations} | saved checkpoint {checkpoint_path}"
-                        )
+                _save_checkpoint_if_needed(
+                    step=step,
+                    args=args,
+                    rank=rank,
+                    checkpoint_run_name=checkpoint_run_name,
+                    model=model,
+                    is_distributed=is_distributed,
+                    optimizer=optimizer,
+                )
 
                 # keep track of smooth timings, last 20 iterations
                 if step > 0 and step > args.num_iterations - 20:
