@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from hellaswag import iterate_examples, render_example
-from model import Model, ModelConfig
+from model import Model, ModelConfig, PositionEmbeddingType
 from torch import distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn import functional as F
@@ -130,7 +130,11 @@ def parse_args():
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--vocab-size", type=int, default=50257)
-    parser.add_argument("--position-embedding-type", type=str, default="learned")
+    parser.add_argument(
+        "--position-embedding-type",
+        type=PositionEmbeddingType,
+        default=PositionEmbeddingType.LEARNED,
+    )
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="gpt2-training")
@@ -247,6 +251,7 @@ def train(args):
             n_layers=args.n_layers,
             context_length=args.context_length,
             vocab_size=args.vocab_size,
+            position_embedding_type=args.position_embedding_type,
         )
     )
     model.train()

@@ -21,6 +21,7 @@ class ModelConfig:
     n_layers: int
     context_length: int
     vocab_size: int
+    position_embedding_type: PositionEmbeddingType
 
 
 class AttentionHead(nn.Module):
