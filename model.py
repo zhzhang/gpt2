@@ -66,11 +66,11 @@ class AttentionHead(nn.Module):
         )
         k = k.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
         v = v.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
-        if self.rotary_embedding is not None:
-            q, k = self.rotary_embedding(q, k)
         # Swap the sequence length and head dimensions, as we are trying to end up with a sequence_length x sequence_length matrix.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
+        if self.rotary_embedding is not None:
+            q, k = self.rotary_embedding(q, k)
         v = v.transpose(1, 2)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
