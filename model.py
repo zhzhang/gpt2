@@ -4,6 +4,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from dataclasses import dataclass
+from enum import Enum
+
+
+class PositionEmbeddingType(Enum):
+    LEARNED = "learned"
+    ROPE = "rope"
+    NOPE = "nope"
 
 
 @dataclass
@@ -142,7 +149,10 @@ class Model(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embedding = nn.Embedding(config.context_length, config.d_model)
+        if config.position_embedding_type == PositionEmbeddingType.LEARNED:
+            self.position_embedding = nn.Embedding(
+                config.context_length, config.d_model
+            )
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -182,10 +192,11 @@ class Model(nn.Module):
         return_logits: bool = True,
     ) -> torch.Tensor:
         token_embeds = self.token_embedding(idx)
-        position_embeds = self.position_embedding(
-            torch.arange(idx.size(1), dtype=torch.long, device=idx.device)
-        )
-        x = token_embeds + position_embeds
+        if self.config.position_embedding_type == PositionEmbeddingType.LEARNED:
+            position_embeds = self.position_embedding(
+                torch.arange(idx.size(1), dtype=torch.long, device=idx.device)
+            )
+            x = token_embeds + position_embeds
 
         for i, block in enumerate(self.blocks):
             x = block(x)

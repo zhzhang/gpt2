@@ -130,6 +130,7 @@ def parse_args():
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--vocab-size", type=int, default=50257)
+    parser.add_argument("--position-embedding-type", type=str, default="learned")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="gpt2-training")
