@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -19,15 +19,17 @@ class ModelConfig:
     n_kv_heads: int
     n_q_heads: int
     n_layers: int
-    context_length: int
+    max_sequence_length: int
     vocab_size: int
     position_embedding_type: PositionEmbeddingType
+    rope_skip_freq: int = 2
+    rope_theta: float = 10000.0
 
 
 class AttentionHead(nn.Module):
     PRINTED = False
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, rotary_embedding: RotaryEmbedding = None):
         super().__init__()
         assert config.d_model % config.n_q_heads == 0, (
             "d_model must be divisible by n_q_heads"
@@ -46,6 +48,7 @@ class AttentionHead(nn.Module):
         )
 
         self.output_projection = nn.Linear(config.d_model, config.d_model)
+        self.rotary_embedding = rotary_embedding
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         config = self.config
@@ -63,6 +66,8 @@ class AttentionHead(nn.Module):
         )
         k = k.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
         v = v.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
+        if self.rotary_embedding is not None:
+            q, k = self.rotary_embedding(q, k)
         # Swap the sequence length and head dimensions, as we are trying to end up with a sequence_length x sequence_length matrix.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -129,10 +134,11 @@ class Block(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
+        rotary_embedding: RotaryEmbedding = None,
     ):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(config.d_model)
-        self.attention = AttentionHead(config)
+        self.attention = AttentionHead(config, rotary_embedding)
         self.layer_norm_2 = nn.LayerNorm(config.d_model)
         # self.feed_forward = SwiGLU(config.d_model)
         self.feed_forward = MLP(config)
@@ -144,6 +150,68 @@ class Block(nn.Module):
         return x
 
 
+class RotaryEmbedding(nn.Module):
+    """
+    [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        # Warm up cache.
+        self.get_rotary_embedding(config.max_sequence_length, torch.device("cpu"))
+
+    def get_rotary_embedding(
+        self, seq_len: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with torch.autocast(device.type, enabled=False):
+            dim = self.config.d_model // self.config.n_q_heads
+            inv_freq = 1.0 / (
+                self.config.rope_theta
+                ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
+            )
+            seq = torch.arange(seq_len, device=device, dtype=torch.float)
+            freqs = torch.einsum("i , j -> i j", seq, inv_freq)
+            positions = torch.cat((freqs, freqs), dim=-1)
+            pos_sin, pos_cos = (
+                positions.sin()[None, None, :, :],
+                positions.cos()[None, None, :, :],
+            )
+        return pos_sin, pos_cos
+
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        B, nh, T, hs = x.size()
+        x = x.view(B, nh, T, 2, hs // 2)
+        x1, x2 = x.unbind(dim=-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(
+        self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_, k_ = q, k
+
+        with torch.autocast(q.device.type, enabled=False):
+            query_len, key_len = (
+                q_.shape[-2],
+                k_.shape[-2],
+            )  # could be different if layer_past not None
+            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+            pos_sin = pos_sin.type_as(q_)
+            pos_cos = pos_cos.type_as(q_)
+            q_ = self.apply_rotary_pos_emb(
+                pos_sin[:, :, key_len - query_len : key_len, :],
+                pos_cos[:, :, key_len - query_len : key_len, :],
+                q_,
+            )
+            k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
+        return q_.type_as(q), k_.type_as(k)
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -152,9 +220,19 @@ class Model(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         if config.position_embedding_type == PositionEmbeddingType.LEARNED:
             self.position_embedding = nn.Embedding(
-                config.context_length, config.d_model
+                config.max_sequence_length, config.d_model
             )
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
+        self.rotary_embedding = RotaryEmbedding(config)
+        # Skip rotary embedding every `rope_skip_freq` layers.
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    config,
+                    self.rotary_embedding if i % config.rope_skip_freq == 0 else None,
+                )
+                for i in range(1, config.n_layers + 1)
+            ]
+        )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         # Ties the token embedding and the output projection.
@@ -248,8 +326,10 @@ if __name__ == "__main__":
         n_kv_heads=3,
         n_q_heads=12,
         n_layers=14,
-        context_length=1024,
+        max_sequence_length=1024,
         vocab_size=50257,
+        position_embedding_type=PositionEmbeddingType.ROPE,
+        rope_skip_freq=2,
     )
     model = Model(config)
     model.configure_optimizers(
@@ -258,3 +338,5 @@ if __name__ == "__main__":
         betas=(0.9, 0.95),
         zero_stage=0,
     )
+    x = torch.randint(0, config.vocab_size, (1, 1024))
+    model(x)

@@ -2,6 +2,7 @@ import argparse
 import glob
 import math
 import os
+import re
 import time
 from contextlib import nullcontext
 
@@ -128,7 +129,7 @@ def parse_args():
     parser.add_argument("--n-kv-heads", type=int, default=12)
     parser.add_argument("--n-q-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
-    parser.add_argument("--context-length", type=int, default=1024)
+    parser.add_argument("--max-sequence-length", type=int, default=1024)
     parser.add_argument("--vocab-size", type=int, default=50257)
     parser.add_argument(
         "--position-embedding-type",
@@ -143,6 +144,7 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=1)
     parser.add_argument("--val-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=2000)
+    parser.add_argument("--save-every", type=int, default=0)
     return parser.parse_args()
 
 
@@ -195,12 +197,13 @@ def evaluate_hellaswag(model, device, rank, world_size):
 
 
 def train(args):
-    assert 1 <= args.seq_len <= args.context_length
+    assert 1 <= args.seq_len <= args.max_sequence_length
     assert args.grad_accum_steps > 0
     assert args.num_iterations >= 0
     assert args.wandb_log_interval > 0
     assert args.val_every >= 0
     assert args.eval_every >= 0
+    assert args.save_every >= 0
 
     local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
@@ -241,6 +244,14 @@ def train(args):
             name=args.wandb_run_name,
             config=vars(args),
         )
+    raw_run_name = wandb_run.name if wandb_run is not None else args.wandb_run_name
+    checkpoint_run_name = None
+    if raw_run_name:
+        checkpoint_run_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_run_name).strip(
+            "._-"
+        )
+        if not checkpoint_run_name:
+            checkpoint_run_name = "run"
 
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     model = Model(
@@ -249,7 +260,7 @@ def train(args):
             n_kv_heads=args.n_kv_heads,
             n_q_heads=args.n_q_heads,
             n_layers=args.n_layers,
-            context_length=args.context_length,
+            max_sequence_length=args.max_sequence_length,
             vocab_size=args.vocab_size,
             position_embedding_type=args.position_embedding_type,
         )
@@ -419,6 +430,30 @@ def train(args):
                                 },
                                 step=step + 1,
                             )
+
+                if args.save_every > 0 and ((step + 1) % args.save_every == 0):
+                    if rank == 0:
+                        step_num = step + 1
+                        if checkpoint_run_name is not None:
+                            checkpoint_path = f"checkpoints/{checkpoint_run_name}/step_{step_num:06d}.pt"
+                        else:
+                            checkpoint_path = (
+                                f"checkpoints/checkpoint_step_{step_num:06d}.pt"
+                            )
+                        checkpoint_model = model.module if is_distributed else model
+                        checkpoint_model = getattr(
+                            checkpoint_model, "_orig_mod", checkpoint_model
+                        )
+                        checkpoint = {
+                            "step": step_num,
+                            "model_state_dict": checkpoint_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "args": vars(args),
+                        }
+                        torch.save(checkpoint, checkpoint_path)
+                        print(
+                            f"step {step_num:4d}/{args.num_iterations} | saved checkpoint {checkpoint_path}"
+                        )
 
                 # keep track of smooth timings, last 20 iterations
                 if step > 0 and step > args.num_iterations - 20:
