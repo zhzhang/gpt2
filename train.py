@@ -144,7 +144,7 @@ def parse_args():
     parser.add_argument("--wandb-log-interval", type=int, default=1)
     parser.add_argument("--val-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=2000)
-    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--checkpoint-every", type=int, default=0)
     return parser.parse_args()
 
 
@@ -203,7 +203,7 @@ def train(args):
     assert args.wandb_log_interval > 0
     assert args.val_every >= 0
     assert args.eval_every >= 0
-    assert args.save_every >= 0
+    assert args.checkpoint_every >= 0
 
     local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
@@ -431,7 +431,9 @@ def train(args):
                                 step=step + 1,
                             )
 
-                if args.save_every > 0 and ((step + 1) % args.save_every == 0):
+                if args.checkpoint_every > 0 and (
+                    (step + 1) % args.checkpoint_every == 0
+                ):
                     if rank == 0:
                         step_num = step + 1
                         if checkpoint_run_name is not None:
